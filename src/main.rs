@@ -6,30 +6,29 @@
 //! ## Execution Flow:
 //! 1.  **Two-Pass Strategy**: The input file is read twice to minimize memory footprint.
 //! 2.  **First Pass (References)**:
-//!     - Streams the JSON to find the `provider_references` array.
+//!     - Streams the JSON token-by-token to find the `provider_references` array without loading the whole file.
 //!     - Deserializes local references and identifies remote references (by URL).
 //!     - Fetches all remote references concurrently using `tokio` and `reqwest`.
 //!     - Consolidates all references and writes them out to `provider_references.json` and `provider_groups.csv`.
 //! 3.  **Second Pass (In-Network Items)**:
 //!     - Streams the JSON again to find the `in_network` array.
-//!     - Uses a bounded channel (`tokio::sync::mpsc`) to act as a work queue.
-//!     - A dedicated task reads `InNetworkItem`s and sends them to the channel.
+//!     - Uses a multi-consumer channel (`async_channel`) to create a work queue.
+//!     - A dedicated blocking task reads `InNetworkItem`s and sends them to the channel.
 //!     - A pool of worker tasks receives items from the channel. Each worker processes an item
-//!       and writes the resulting CSV records to the appropriate file (e.g., `in_network_CODE.csv`).
-//!     - File writers are managed concurrently using a `DashMap` for thread-safe access without blocking.
+//!       and writes the resulting CSV records to the appropriate file writer task.
 //! 4.  **R2 Upload**:
 //!     - After all local files are written, the program walks the output directory.
-//!     - It uploads all generated CSV files to the specified R2 bucket concurrently,
-//!       using a semaphore to limit the number of simultaneous uploads.
+//!     - It uploads all generated CSV files to the specified R2 bucket concurrently.
 //! 5.  **Cleanup**: Deletes the local output directory after a successful upload.
 
 use anyhow::{anyhow, Context, Result};
-use aws_config::meta::region::RegionProviderChain;
+use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
+use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use dashmap::DashMap;
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -38,24 +37,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tokio::task;
 
 // --- Data Structures (matching the JSON) ---
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Tin {
     r#type: String,
     value: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ProviderGroup {
     npi: Vec<serde_json::Value>,
     tin: Tin,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ProviderReference {
     provider_group_id: u64,
     provider_groups: Vec<ProviderGroup>,
@@ -156,23 +156,41 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Finds the specified key at the root of the JSON object and returns a streaming deserializer
-/// positioned at the beginning of that key's value (expected to be an array).
-fn find_json_key_stream<'a, R: std::io::Read>(
-    reader: R,
+/// A helper to advance a JSON stream to a specific key within the root object.
+/// This allows for true streaming without loading the entire file into memory.
+fn advance_to_key<'de, R: std::io::Read>(
+    deserializer: &mut serde_json::Deserializer<serde_json::de::IoRead<R>>,
     key_to_find: &str,
-) -> Result<serde_json::StreamDeserializer<'a, serde_json::de::IoRead<R>, serde_json::Value>> {
-    let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<serde_json::Value>();
-
+) -> Result<()> {
+    use serde::de::Token;
     // Expect the start of the root object `{`
-    if let Some(Ok(serde_json::Value::Object(mut map))) = stream.next() {
-        if let Some(value) = map.remove(key_to_find) {
-            // Re-serialize the found value to create a new reader for streaming its contents
-            let temp_reader = std::io::Cursor::new(value.to_string());
-            return Ok(serde_json::Deserializer::from_reader(temp_reader).into_iter());
+    match deserializer.next_token()? {
+        Some(Token::Map { .. }) => (),
+        _ => return Err(anyhow!("Expected a map at the root of the JSON file")),
+    }
+
+    // Iterate through keys until we find the one we want
+    loop {
+        match deserializer.next_token()? {
+            Some(Token::Str(key)) if key == key_to_find => {
+                // Found the key, the next token will be the start of its value (e.g., `[`)
+                return Ok(());
+            }
+            Some(Token::Str(_)) => {
+                // This is not the key we are looking for, so we need to skip its value
+                deserializer.skip_value()?;
+            }
+            Some(Token::MapEnd) => {
+                // Reached the end of the root object without finding the key
+                return Err(anyhow!("Key '{}' not found in JSON file", key_to_find));
+            }
+            None => {
+                return Err(anyhow!("Unexpected end of file while searching for key"));
+            }
+            _ => { // Skip other tokens
+            }
         }
     }
-    Err(anyhow!("Key '{}' not found at the root of the JSON file.", key_to_find))
 }
 
 /// Pass 1: Extracts local references, fetches remote ones, and writes consolidated results.
@@ -183,23 +201,33 @@ async fn extract_and_fetch_references(
     let file = File::open(input_path).context("Failed to open input file for Pass 1")?;
     let gz = GzDecoder::new(file);
     let buf_reader = BufReader::new(gz);
+    let mut de = serde_json::Deserializer::from_reader(buf_reader);
 
     println!("🔍 Searching for 'provider_references' key...");
-    let stream = find_json_key_stream(buf_reader, "provider_references")
-        .context("Could not find 'provider_references' stream")?;
-    
-    let (mut local_refs, mut remote_refs) = (vec![], vec![]);
-    for value in stream {
-        let ref_type: ReferenceType = serde_json::from_value(value?)?;
-        match ref_type {
-            ReferenceType::Local(r) => local_refs.push(r),
-            ReferenceType::Remote(r) => remote_refs.push(r),
-        }
-    }
+    advance_to_key(&mut de, "provider_references")
+        .context("Could not find 'provider_references' array")?;
+
+    // Now that we're at the array, deserialize it. This is memory-efficient because
+    // serde can deserialize the Vec<T> by iterating, it doesn't need to build a `Value` tree first.
+    let references: Vec<ReferenceType> =
+        serde::Deserialize::deserialize(&mut de).context("Failed to deserialize provider_references array")?;
+
+    let (local_refs, remote_refs): (Vec<_>, Vec<_>) = references.into_iter().partition(|r| matches!(r, ReferenceType::Local(_)));
+
+    let mut local_refs: Vec<ProviderReference> = local_refs.into_iter().map(|r| match r {
+        ReferenceType::Local(pr) => pr,
+        _ => unreachable!(),
+    }).collect();
+
+    let remote_refs: Vec<RemoteProviderReference> = remote_refs.into_iter().map(|r| match r {
+        ReferenceType::Remote(rr) => rr,
+        _ => unreachable!(),
+    }).collect();
+
+
     println!("Found {} local and {} remote references.", local_refs.len(), remote_refs.len());
 
     // Fetch remote references concurrently
-    let mut fetched_refs = Vec::with_capacity(remote_refs.len());
     if !remote_refs.is_empty() {
         println!("📡 Fetching {} remote references...", remote_refs.len());
         let client = reqwest::Client::new();
@@ -210,7 +238,6 @@ async fn extract_and_fetch_references(
                     match client.get(&remote_ref.location).send().await {
                         Ok(resp) => match resp.json::<ProviderReference>().await {
                             Ok(mut provider_ref) => {
-                                // Important: The fetched JSON doesn't contain the ID, so we add it back.
                                 provider_ref.provider_group_id = remote_ref.provider_group_id;
                                 Ok(provider_ref)
                             }
@@ -222,7 +249,7 @@ async fn extract_and_fetch_references(
             })
             .buffer_unordered(100); // Concurrency limit
 
-        fetched_refs = bodies.filter_map(|res| async {
+        let fetched_refs = bodies.filter_map(|res| async {
                 match res {
                     Ok(r) => Some(r),
                     Err(e) => {
@@ -232,14 +259,13 @@ async fn extract_and_fetch_references(
                 }
             }).collect::<Vec<_>>().await;
         println!("Successfully fetched {} remote references.", fetched_refs.len());
+        local_refs.extend(fetched_refs);
     }
 
-    let all_refs = [local_refs, fetched_refs].concat();
-
     // Write consolidated references to output files
-    write_provider_references_files(&all_refs, output_dir)?;
+    write_provider_references_files(&local_refs, output_dir)?;
 
-    Ok(all_refs)
+    Ok(local_refs)
 }
 
 /// Writes the provider references to both a JSON and a CSV file.
@@ -281,35 +307,31 @@ fn write_provider_references_files(refs: &[ProviderReference], output_dir: &Path
     Ok(())
 }
 
-
 /// Pass 2: Streams the in_network array and processes items using a pool of worker tasks.
 async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Result<()> {
     let in_network_dir = output_dir.join("in_network");
     fs::create_dir_all(&in_network_dir)?;
 
-    // A thread-safe map to hold file writers for each billing code.
     let writer_map: Arc<DashMap<String, mpsc::Sender<String>>> = Arc::new(DashMap::new());
     
-    // Channel to send work from the JSON reader to the worker pool
-    let (tx, mut rx) = mpsc::channel::<InNetworkItem>(2048); // Bounded channel
+    // Use an MPMC channel from `async_channel` so multiple workers can receive.
+    let (tx, rx) = async_channel::bounded::<InNetworkItem>(2048);
 
     let item_count = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
-    let total_workers = num_cpus::get_physical(); // Use physical cores
+    let total_workers = num_cpus::get_physical();
     println!("⚙️  Starting {} worker tasks for in-network processing.", total_workers);
 
     // --- Spawn Worker Tasks ---
     let mut worker_handles = Vec::new();
-    for i in 0..total_workers {
-        let mut rx = rx;
+    for _ in 0..total_workers {
+        let rx = rx.clone(); // Clone the receiver for each worker
         let writer_map = writer_map.clone();
         let in_network_dir = in_network_dir.clone();
         let item_count = item_count.clone();
-        let start_time = start_time.clone();
 
         let handle = task::spawn(async move {
-            while let Some(item) = rx.recv().await {
-                // Process the item and generate CSV lines
+            while let Ok(item) = rx.recv().await {
                 let mut records_by_code: HashMap<String, String> = HashMap::new();
                 for rate in &item.negotiated_rates {
                     for price in &rate.negotiated_prices {
@@ -326,23 +348,17 @@ async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Resul
                                 price.billing_class,
                                 modifiers
                             );
-                            records_by_code
-                                .entry(item.billing_code.clone())
-                                .or_default()
-                                .push_str(&record);
+                            records_by_code.entry(item.billing_code.clone()).or_default().push_str(&record);
                         }
                     }
                 }
                 
-                // Send records to the appropriate file writer task
                 for (code, records) in records_by_code {
                      if let Some(writer_tx) = writer_map.get(&code) {
                         if writer_tx.send(records).await.is_err() {
-                            // This means the receiver (file writer) has been dropped, which is an error.
                             eprintln!("Error: File writer for code {} has closed.", code);
                         }
                     } else {
-                        // Create a new file writer task for this billing code
                         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(128);
                         let file_path = in_network_dir.join(format!("in_network_{}.csv", code));
                         writer_map.insert(code.clone(), writer_tx.clone());
@@ -362,46 +378,58 @@ async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Resul
                     }
                 }
 
-                // Update and report progress
                 let count = item_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if count % 10000 == 0 {
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    println!(
-                        "Processed {} items... ({:.2} items/sec)",
-                        count,
-                        count as f64 / elapsed
-                    );
+                    println!( "Processed {} items... ({:.2} items/sec)", count, count as f64 / elapsed );
                 }
             }
         });
         worker_handles.push(handle);
     }
     
-    // --- Spawn JSON Reader Task ---
-    // This task reads from the file and sends items to the workers.
-    // It runs on a separate blocking thread to avoid blocking the async runtime.
+    // Create an owned PathBuf to move into the blocking task.
+    let input_path_owned = input_path.to_path_buf();
     let reader_handle = task::spawn_blocking(move || -> Result<()> {
-        let file = File::open(input_path).context("Failed to open input file for Pass 2")?;
+        let file = File::open(input_path_owned).context("Failed to open input file for Pass 2")?;
         let gz = GzDecoder::new(file);
         let buf_reader = BufReader::new(gz);
-        
-        println!("🔍 Searching for 'in_network' key...");
-        let stream = find_json_key_stream(buf_reader, "in_network")
-            .context("Could not find 'in_network' stream")?;
+        let mut de = serde_json::Deserializer::from_reader(buf_reader);
 
-        for value in stream {
-            let item: InNetworkItem = serde_json::from_value(value?)?;
-            if tx.blocking_send(item).is_err() {
-                // If the channel is closed, it means the workers are done.
-                break;
-            }
+        println!("🔍 Searching for 'in_network' key...");
+        advance_to_key(&mut de, "in_network").context("Could not find 'in_network' array")?;
+
+        // Now stream the array items one by one
+        use serde::de::Token;
+        match de.next_token()? {
+            Some(Token::Seq { .. }) => (),
+            _ => return Err(anyhow!("Expected 'in_network' value to be an array")),
+        }
+
+        loop {
+             match de.next_token()? {
+                Some(Token::Map { .. }) => {
+                    // We found the start of an object, now deserialize it
+                    let item: InNetworkItem = serde::Deserialize::deserialize(&mut de)?;
+                    if tx.send_blocking(item).is_err() {
+                        break; // Channel closed, workers are shutting down
+                    }
+                }
+                Some(Token::SeqEnd) => {
+                    break; // End of the array
+                }
+                None => {
+                    break; // End of file
+                }
+                 _ => {} // Skip other tokens
+             }
         }
         Ok(())
     });
 
-    // Wait for the reader to finish, then close the channel to signal workers to stop.
     reader_handle.await??;
-    drop(tx);
+    // The channel will close automatically when `tx` from spawn_blocking goes out of scope.
+    // This will signal the workers to finish.
 
     // Wait for all worker tasks to complete
     for handle in worker_handles {
@@ -415,27 +443,25 @@ async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Resul
     Ok(())
 }
 
-/// Sets up the S3 client to connect to an R2 bucket.
+
+/// Sets up the S3 client to connect to an R2 bucket using the modern AWS SDK config.
 async fn setup_r2_client() -> Result<S3Client> {
     let account_id = env::var("R2_ACCOUNT_ID").context("R2_ACCOUNT_ID not set")?;
     let access_key_id = env::var("R2_ACCESS_KEY_ID").context("R2_ACCESS_KEY_ID not set")?;
     let secret_access_key = env::var("R2_SECRET_ACCESS_KEY").context("R2_SECRET_ACCESS_KEY not set")?;
-    let bucket_name = env::var("R2_BUCKET_NAME").context("R2_BUCKET_NAME not set")?;
-
+    
     let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
 
-    let credentials = aws_config::Credentials::new(
+    let credentials = Credentials::new(
         access_key_id,
         secret_access_key,
         None,
         None,
         "Static",
     );
-    
-    let region_provider = RegionProviderChain::first_try(Region::new("auto"));
 
-    let config = aws_config::from_env()
-        .region(region_provider)
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(RegionProviderChain::first_try(Region::new("auto")))
         .credentials_provider(credentials)
         .endpoint_url(endpoint_url)
         .load()
@@ -472,7 +498,7 @@ async fn upload_to_r2(client: S3Client, output_dir: &Path, r2_prefix: &str) -> R
             let key = format!(
                 "{}/{}",
                 r2_prefix,
-                path.file_name().unwrap().to_str().unwrap()
+                path.strip_prefix(output_dir).unwrap().to_str().unwrap().replace("\\", "/")
             );
             
             println!("Uploading {} to s3://{}/{}", path.display(), bucket_name, key);
@@ -500,3 +526,4 @@ async fn upload_to_r2(client: S3Client, output_dir: &Path, r2_prefix: &str) -> R
 
     Ok(())
 }
+
