@@ -6,14 +6,14 @@
 //! ## Execution Flow:
 //! 1.  **Two-Pass Strategy**: The input file is read twice to minimize memory footprint.
 //! 2.  **First Pass (References)**:
-//!     - Streams the JSON token-by-token to find the `provider_references` array without loading the whole file.
+//!     - Reads the file line-by-line to find the JSON object containing the `provider_references` array.
 //!     - Deserializes local references and identifies remote references (by URL).
 //!     - Fetches all remote references concurrently using `tokio` and `reqwest`.
 //!     - Consolidates all references and writes them out to `provider_references.json` and `provider_groups.csv`.
 //! 3.  **Second Pass (In-Network Items)**:
-//!     - Streams the JSON again to find the `in_network` array.
+//!     - Reads the file line-by-line again to find the JSON object(s) containing the `in_network` array.
 //!     - Uses a multi-consumer channel (`async_channel`) to create a work queue.
-//!     - A dedicated blocking task reads `InNetworkItem`s and sends them to the channel.
+//!     - A dedicated blocking task streams `InNetworkItem`s and sends them to the channel.
 //!     - A pool of worker tasks receives items from the channel. Each worker processes an item
 //!       and writes the resulting CSV records to the appropriate file writer task.
 //! 4.  **R2 Upload**:
@@ -28,11 +28,11 @@ use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use dashmap::DashMap;
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt};
-use serde::{de::Visitor, de::DeserializeSeed, Deserializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -171,13 +171,31 @@ async fn extract_and_fetch_references(
     let gz = GzDecoder::new(file);
     let buf_reader = BufReader::new(gz);
 
-    println!("🔍 Deserializing 'provider_references' key...");
-    // For pass 1, the reference list is assumed to be small enough to fit in memory.
-    // Deserializing into a wrapper struct is the simplest and most robust method.
-    // `serde` will efficiently ignore all other top-level keys.
-    let wrapper: ReferencesWrapper =
-        serde_json::from_reader(buf_reader).context("Failed to deserialize ReferencesWrapper")?;
-    let references = wrapper.provider_references;
+    println!("🔍 Searching for 'provider_references' key line-by-line...");
+
+    let mut references: Vec<ReferenceType> = Vec::new();
+
+    // Read the file line-by-line to handle JSON Lines format.
+    for line in buf_reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Try to parse the line into a generic JSON value first.
+        let v: serde_json::Value = serde_json::from_str(&line)?;
+
+        // Check if this JSON object contains the 'provider_references' key.
+        if let Some(refs_val) = v.get("provider_references") {
+            references = serde_json::from_value(refs_val.clone())?;
+            println!("Found provider references object.");
+            break; // Stop after finding the first object with references.
+        }
+    }
+
+    if references.is_empty() {
+        return Err(anyhow!("Could not find 'provider_references' in any line of the input file."));
+    }
 
     let (local_refs, remote_refs): (Vec<_>, Vec<_>) =
         references.into_iter().partition(|r| matches!(r, ReferenceType::Local(_)));
@@ -287,78 +305,6 @@ fn write_provider_references_files(refs: &[ProviderReference], output_dir: &Path
     Ok(())
 }
 
-/// This struct will act as a `DeserializeSeed`, which is the correct way
-/// to integrate a custom streaming process with Serde's `MapAccess` visitor.
-struct InNetworkStreamingVisitor {
-    tx: async_channel::Sender<InNetworkItem>,
-}
-
-impl<'de> DeserializeSeed<'de> for InNetworkStreamingVisitor {
-    type Value = (); // We don't return a value, we send items over a channel.
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // The seed's job is to start the deserialization of the array (sequence).
-        // It passes itself along as the `Visitor` for that sequence.
-        deserializer.deserialize_seq(self)
-    }
-}
-
-
-/// This is the `Visitor` part of the implementation. It's called by `deserialize_seq`
-/// and is responsible for iterating over the array elements.
-impl<'de> Visitor<'de> for InNetworkStreamingVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a sequence of in-network items")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        while let Some(item) = seq.next_element::<InNetworkItem>()? {
-            if self.tx.send_blocking(item).is_err() {
-                // If the channel is closed, the workers have shut down. Stop parsing.
-                break;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Implements `serde::de::Visitor` to find a specific key in the top-level JSON object.
-struct RootVisitor {
-    tx: async_channel::Sender<InNetworkItem>,
-}
-
-impl<'de> Visitor<'de> for RootVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a map")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::MapAccess<'de>,
-    {
-        while let Some(key) = map.next_key::<String>()? {
-            if key == "in_network" {
-                // Found the key. Now deserialize its value using our custom streaming seed.
-                return map.next_value_seed(InNetworkStreamingVisitor { tx: self.tx });
-            } else {
-                // This is not the key we want, so skip its value efficiently.
-                map.next_value::<serde::de::IgnoredAny>()?;
-            }
-        }
-        Err(serde::de::Error::custom("key 'in_network' not found"))
-    }
-}
-
 /// Pass 2: Streams the in_network array and processes items using a pool of worker tasks.
 async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Result<()> {
     let in_network_dir = output_dir.join("in_network");
@@ -453,12 +399,29 @@ async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Resul
         let file = File::open(input_path_owned).context("Failed to open input file for Pass 2")?;
         let gz = GzDecoder::new(file);
         let buf_reader = BufReader::new(gz);
-        let mut de = serde_json::Deserializer::from_reader(buf_reader);
 
-        println!("🔍 Streaming 'in_network' items...");
-        // Use our custom visitor to drive the deserialization process.
-        de.deserialize_map(RootVisitor { tx })?;
+        println!("🔍 Streaming 'in_network' items line-by-line...");
 
+        for line in buf_reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            
+            // This is a simplified approach. A more robust solution might use a custom Visitor
+            // if memory becomes an issue on very long lines.
+            let v: serde_json::Value = serde_json::from_str(&line)?;
+
+            if let Some(items_val) = v.get("in_network") {
+                 let items: Vec<InNetworkItem> = serde_json::from_value(items_val.clone())?;
+                 for item in items {
+                     if tx.send_blocking(item).is_err() {
+                         // Channel is closed, stop processing.
+                         return Ok(());
+                     }
+                 }
+            }
+        }
         Ok(())
     });
 
