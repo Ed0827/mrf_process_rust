@@ -28,11 +28,11 @@ use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use dashmap::DashMap;
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt};
-use serde::{de::Visitor, Deserialize, Serialize};
+use serde::{de::Visitor, de::DeserializeSeed, Deserializer, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -287,12 +287,28 @@ fn write_provider_references_files(refs: &[ProviderReference], output_dir: &Path
     Ok(())
 }
 
-/// Implements `serde::de::Visitor` to stream a large JSON array.
-/// This is the core of the low-memory processing for Pass 2.
+/// This struct will act as a `DeserializeSeed`, which is the correct way
+/// to integrate a custom streaming process with Serde's `MapAccess` visitor.
 struct InNetworkStreamingVisitor {
     tx: async_channel::Sender<InNetworkItem>,
 }
 
+impl<'de> DeserializeSeed<'de> for InNetworkStreamingVisitor {
+    type Value = (); // We don't return a value, we send items over a channel.
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // The seed's job is to start the deserialization of the array (sequence).
+        // It passes itself along as the `Visitor` for that sequence.
+        deserializer.deserialize_seq(self)
+    }
+}
+
+
+/// This is the `Visitor` part of the implementation. It's called by `deserialize_seq`
+/// and is responsible for iterating over the array elements.
 impl<'de> Visitor<'de> for InNetworkStreamingVisitor {
     type Value = ();
 
@@ -332,7 +348,7 @@ impl<'de> Visitor<'de> for RootVisitor {
     {
         while let Some(key) = map.next_key::<String>()? {
             if key == "in_network" {
-                // Found the key. Now deserialize its value using our custom streaming visitor.
+                // Found the key. Now deserialize its value using our custom streaming seed.
                 return map.next_value_seed(InNetworkStreamingVisitor { tx: self.tx });
             } else {
                 // This is not the key we want, so skip its value efficiently.
